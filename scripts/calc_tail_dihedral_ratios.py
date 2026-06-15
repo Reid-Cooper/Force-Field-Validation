@@ -16,6 +16,12 @@ The script also writes a PNG plot of the selected ratio/metric versus tail
 dihedral position. Each point corresponds to the central carbon-carbon bond of
 one four-carbon dihedral.
 
+The script also produces a separate transition-count CSV by default. If the
+main output is named popc_tail_trans_gauche.csv, the transition file will be
+named popc_tail_trans_gauche_transitions_count.csv unless --transition-output
+is used. This file reports how often each tail dihedral changes rotamer state
+between consecutive analyzed frames.
+
 Install dependencies:
     python -m pip install MDAnalysis numpy matplotlib
 
@@ -40,6 +46,8 @@ For unusual lipid or force-field naming, explicit --tail arguments are safer.
 
 from __future__ import annotations
 
+# Standard-library imports used for command-line parsing, CSV writing,
+# filename handling, numeric formatting, and temporary Matplotlib cache setup.
 import argparse
 import csv
 import math
@@ -53,23 +61,43 @@ from pathlib import Path
 from typing import DefaultDict, Dict, List, Optional, Sequence, Tuple
 
 
+# A dihedral summary key identifies one residue name, one tail, one position
+# down the tail, and the four atom names that define the torsion.
 Key = Tuple[str, str, int, str, str, str, str]
 
+# Integer labels for the rotamer states. These compact labels make transition
+# counting faster and less error-prone than comparing strings for every frame.
+STATE_INVALID = -1
+STATE_OTHER = 0
+STATE_TRANS = 1
+STATE_GAUCHE_PLUS = 2
+STATE_GAUCHE_MINUS = 3
+
+
+# ---------------------------------------------------------------------------
+# Data Containers
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class TailDefinition:
+    """User-provided tail label and ordered atom names from headgroup to tail end."""
+
     label: str
     atom_names: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class DihedralSpec:
+    """One concrete four-atom dihedral to evaluate in the MDAnalysis Universe."""
+
     key: Key
     atom_indices: Tuple[int, int, int, int]
 
 
 @dataclass
 class Accumulator:
+    """Running counts and circular-angle sums for one grouped dihedral."""
+
     key: Key
     total: int = 0
     trans_count: int = 0
@@ -80,7 +108,28 @@ class Accumulator:
     cos_sum: float = 0.0
 
 
+@dataclass
+class TransitionAccumulator:
+    """Running frame-to-frame transition counts for one grouped dihedral."""
+
+    key: Key
+    valid_frame_pairs: int = 0
+    state_change_count: int = 0
+    trans_to_gauche_count: int = 0
+    gauche_to_trans_count: int = 0
+    gauche_plus_to_minus_count: int = 0
+    gauche_minus_to_plus_count: int = 0
+    to_other_count: int = 0
+    from_other_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Command-Line Interface
+# ---------------------------------------------------------------------------
+
 def build_parser() -> argparse.ArgumentParser:
+    """Create the CLI parser and define all user-facing options."""
+
     parser = argparse.ArgumentParser(
         description=(
             "Calculate trans/gauche ratios for every four-carbon dihedral down "
@@ -199,6 +248,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output CSV path. Default: tail_dihedral_trans_gauche.csv.",
     )
     parser.add_argument(
+        "--transition-output",
+        default=None,
+        help=(
+            "Output CSV path for frame-to-frame rotamer transition counts. "
+            "Default: <output_stem>_transitions_count.csv."
+        ),
+    )
+    parser.add_argument(
+        "--no-transition-output",
+        action="store_true",
+        help="Skip writing the separate transition-count CSV.",
+    )
+    parser.add_argument(
         "--plot-output",
         default=None,
         help=(
@@ -226,6 +288,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# ---------------------------------------------------------------------------
+# Tail Atom Parsing
+# ---------------------------------------------------------------------------
+
 def expand_atom_token(token: str) -> List[str]:
     """Expand compact atom-name ranges such as C3[1-16] or C[1-18]A."""
     token = token.strip()
@@ -250,6 +316,8 @@ def expand_atom_token(token: str) -> List[str]:
 
 
 def parse_tail_definition(text: str, index: int) -> TailDefinition:
+    """Parse one --tail value into a TailDefinition."""
+
     if ":" in text:
         label, atom_text = text.split(":", 1)
         label = label.strip()
@@ -270,10 +338,18 @@ def parse_tail_definition(text: str, index: int) -> TailDefinition:
 
 
 def parse_tail_definitions(values: Sequence[str]) -> List[TailDefinition]:
+    """Parse every --tail argument provided by the user."""
+
     return [parse_tail_definition(value, index + 1) for index, value in enumerate(values)]
 
 
+# ---------------------------------------------------------------------------
+# Residue/Tail Discovery and Dihedral Setup
+# ---------------------------------------------------------------------------
+
 def residue_atom_lookup(residue) -> Tuple[Dict[str, object], List[str]]:
+    """Build a residue atom lookup keyed by atom name."""
+
     atoms: Dict[str, object] = {}
     duplicates: List[str] = []
     for atom in residue.atoms:
@@ -286,6 +362,8 @@ def residue_atom_lookup(residue) -> Tuple[Dict[str, object], List[str]]:
 
 
 def add_dihedral_specs(specs: List[DihedralSpec], resname: str, tail_label: str, atoms: Sequence[object]) -> None:
+    """Add every consecutive four-atom torsion along an ordered tail."""
+
     for offset in range(len(atoms) - 3):
         quartet = atoms[offset : offset + 4]
         atom_names = tuple(atom.name.strip() for atom in quartet)
@@ -299,6 +377,8 @@ def build_explicit_specs(
     tail_definitions: Sequence[TailDefinition],
     strict: bool,
 ) -> Tuple[List[DihedralSpec], Dict[Tuple[str, str], int], Dict[Tuple[str, str], List[str]]]:
+    """Build dihedral definitions from explicit --tail atom-name lists."""
+
     specs: List[DihedralSpec] = []
     skipped: DefaultDict[Tuple[str, str], int] = defaultdict(int)
     missing_examples: Dict[Tuple[str, str], List[str]] = {}
@@ -377,6 +457,8 @@ def candidate_tail_chains(residue, min_atoms: int = 4) -> List[Tuple[str, List[o
 
 
 def build_guessed_specs(residues) -> Tuple[List[DihedralSpec], Dict[str, int]]:
+    """Build dihedral definitions by guessing common lipid tail naming schemes."""
+
     specs: List[DihedralSpec] = []
     guessed_residue_counts: DefaultDict[str, int] = defaultdict(int)
 
@@ -392,7 +474,13 @@ def build_guessed_specs(residues) -> Tuple[List[DihedralSpec], Dict[str, int]]:
     return specs, dict(guessed_residue_counts)
 
 
+# ---------------------------------------------------------------------------
+# Dependency Loading and Trajectory Helpers
+# ---------------------------------------------------------------------------
+
 def import_analysis_dependencies():
+    """Import numpy and MDAnalysis only when analysis is actually run."""
+
     try:
         import numpy as np
     except ImportError as exc:
@@ -410,12 +498,64 @@ def import_analysis_dependencies():
 
 
 def has_valid_box(dimensions, np_module) -> bool:
+    """Return True when a trajectory frame has usable periodic box dimensions."""
+
     if dimensions is None:
         return False
     dims = np_module.asarray(dimensions)
     if dims.size < 6:
         return False
     return bool(np_module.all(np_module.isfinite(dims[:6])) and np_module.all(dims[:3] > 0.0))
+
+
+# ---------------------------------------------------------------------------
+# State Classification, Ratio Counts, and Transition Counts
+# ---------------------------------------------------------------------------
+
+def classify_angle_states(
+    angles_rad,
+    np_module,
+    trans_cutoff_deg: float,
+    cis_cutoff_deg: float,
+    state_definition: str,
+    window_deg: float,
+):
+    """Classify dihedral angles as trans, gauche+, gauche-, other, or invalid."""
+
+    states = np_module.full(angles_rad.shape, STATE_INVALID, dtype=np_module.int8)
+    finite = np_module.isfinite(angles_rad)
+    if not np_module.any(finite):
+        return states
+
+    angles_deg = np_module.degrees(angles_rad[finite])
+    abs_angles = np_module.abs(angles_deg)
+    finite_states = np_module.full(angles_deg.shape, STATE_OTHER, dtype=np_module.int8)
+
+    if state_definition == "window":
+        # calc_dihedrals returns angles in [-180, 180]. Near-trans values can
+        # sit on either side of that periodic boundary, so use abs(phi).
+        trans = (180.0 - abs_angles) <= window_deg
+        gauche_plus = np_module.abs(angles_deg - 60.0) <= window_deg
+        gauche_minus = np_module.abs(angles_deg + 60.0) <= window_deg
+        finite_states[gauche_plus] = STATE_GAUCHE_PLUS
+        finite_states[gauche_minus] = STATE_GAUCHE_MINUS
+        finite_states[trans] = STATE_TRANS
+    else:
+        if cis_cutoff_deg > 0.0:
+            other = abs_angles <= cis_cutoff_deg
+        else:
+            other = np_module.zeros(angles_deg.shape, dtype=bool)
+
+        trans = (~other) & (abs_angles >= trans_cutoff_deg)
+        gauche = (~other) & (~trans)
+        gauche_plus = gauche & (angles_deg > 0.0)
+        gauche_minus = gauche & (angles_deg < 0.0)
+        finite_states[gauche_plus] = STATE_GAUCHE_PLUS
+        finite_states[gauche_minus] = STATE_GAUCHE_MINUS
+        finite_states[trans] = STATE_TRANS
+
+    states[finite] = finite_states
+    return states
 
 
 def update_accumulator(
@@ -427,42 +567,67 @@ def update_accumulator(
     state_definition: str,
     window_deg: float,
 ) -> None:
+    """Add one frame's angles to the trans/gauche count accumulator."""
+
     finite_angles = angles_rad[np_module.isfinite(angles_rad)]
     if finite_angles.size == 0:
         return
 
-    angles_deg = np_module.degrees(finite_angles)
-    abs_angles = np_module.abs(angles_deg)
-
-    if state_definition == "window":
-        # calc_dihedrals returns angles in [-180, 180]. Near-trans values can
-        # sit on either side of that periodic boundary, so use abs(phi).
-        trans = (180.0 - abs_angles) <= window_deg
-        gauche_plus = np_module.abs(angles_deg - 60.0) <= window_deg
-        gauche_minus = np_module.abs(angles_deg + 60.0) <= window_deg
-        other = ~(trans | gauche_plus | gauche_minus)
-    else:
-        if cis_cutoff_deg > 0.0:
-            other = abs_angles <= cis_cutoff_deg
-        else:
-            other = np_module.zeros(angles_deg.shape, dtype=bool)
-
-        trans = (~other) & (abs_angles >= trans_cutoff_deg)
-        gauche = (~other) & (~trans)
-        gauche_plus = gauche & (angles_deg > 0.0)
-        gauche_minus = gauche & (angles_deg < 0.0)
-        other = other | (gauche & (angles_deg == 0.0))
+    states = classify_angle_states(
+        finite_angles,
+        np_module,
+        trans_cutoff_deg,
+        cis_cutoff_deg,
+        state_definition,
+        window_deg,
+    )
 
     accumulator.total += int(finite_angles.size)
-    accumulator.trans_count += int(np_module.count_nonzero(trans))
-    accumulator.gauche_plus_count += int(np_module.count_nonzero(gauche_plus))
-    accumulator.gauche_minus_count += int(np_module.count_nonzero(gauche_minus))
-    accumulator.other_count += int(np_module.count_nonzero(other))
+    accumulator.trans_count += int(np_module.count_nonzero(states == STATE_TRANS))
+    accumulator.gauche_plus_count += int(np_module.count_nonzero(states == STATE_GAUCHE_PLUS))
+    accumulator.gauche_minus_count += int(np_module.count_nonzero(states == STATE_GAUCHE_MINUS))
+    accumulator.other_count += int(np_module.count_nonzero(states == STATE_OTHER))
     accumulator.sin_sum += float(np_module.sin(finite_angles).sum())
     accumulator.cos_sum += float(np_module.cos(finite_angles).sum())
 
 
+def is_gauche_state(state: int) -> bool:
+    """Return True for either gauche+ or gauche-."""
+
+    return state in (STATE_GAUCHE_PLUS, STATE_GAUCHE_MINUS)
+
+
+def update_transition_accumulator(accumulator: TransitionAccumulator, previous_state: int, current_state: int) -> None:
+    """Count one frame-to-frame state comparison for a single dihedral."""
+
+    if previous_state == STATE_INVALID or current_state == STATE_INVALID:
+        return
+
+    accumulator.valid_frame_pairs += 1
+    if previous_state == current_state:
+        return
+
+    accumulator.state_change_count += 1
+
+    if previous_state == STATE_TRANS and is_gauche_state(current_state):
+        accumulator.trans_to_gauche_count += 1
+    elif is_gauche_state(previous_state) and current_state == STATE_TRANS:
+        accumulator.gauche_to_trans_count += 1
+
+    if previous_state == STATE_GAUCHE_PLUS and current_state == STATE_GAUCHE_MINUS:
+        accumulator.gauche_plus_to_minus_count += 1
+    elif previous_state == STATE_GAUCHE_MINUS and current_state == STATE_GAUCHE_PLUS:
+        accumulator.gauche_minus_to_plus_count += 1
+
+    if previous_state != STATE_OTHER and current_state == STATE_OTHER:
+        accumulator.to_other_count += 1
+    elif previous_state == STATE_OTHER and current_state != STATE_OTHER:
+        accumulator.from_other_count += 1
+
+
 def format_float(value: Optional[float]) -> str:
+    """Format numeric values consistently for CSV output."""
+
     if value is None:
         return ""
     if math.isnan(value):
@@ -473,6 +638,8 @@ def format_float(value: Optional[float]) -> str:
 
 
 def trans_gauche_ratio(trans_count: int, gauche_count: int) -> float:
+    """Compute trans/gauche while preserving nan/inf for zero-count cases."""
+
     if gauche_count:
         return trans_count / gauche_count
     if trans_count:
@@ -481,6 +648,8 @@ def trans_gauche_ratio(trans_count: int, gauche_count: int) -> float:
 
 
 def accumulator_metric(accumulator: Accumulator, metric: str) -> float:
+    """Return the requested metric value for plotting."""
+
     gauche_count = accumulator.gauche_plus_count + accumulator.gauche_minus_count
     total = accumulator.total
 
@@ -494,6 +663,8 @@ def accumulator_metric(accumulator: Accumulator, metric: str) -> float:
 
 
 def accumulator_row(accumulator: Accumulator, n_lipids: int, n_frames: int) -> Dict[str, object]:
+    """Convert one accumulated dihedral summary into a CSV row."""
+
     resname, tail, dihedral_index, atom1, atom2, atom3, atom4 = accumulator.key
     gauche_count = accumulator.gauche_plus_count + accumulator.gauche_minus_count
     total = accumulator.total
@@ -532,12 +703,60 @@ def accumulator_row(accumulator: Accumulator, n_lipids: int, n_frames: int) -> D
     }
 
 
+def transition_row(
+    accumulator: TransitionAccumulator,
+    n_lipids: int,
+    n_frame_pairs: int,
+) -> Dict[str, object]:
+    """Convert one accumulated transition summary into a CSV row."""
+
+    resname, tail, dihedral_index, atom1, atom2, atom3, atom4 = accumulator.key
+    trans_gauche_transition_count = accumulator.trans_to_gauche_count + accumulator.gauche_to_trans_count
+
+    if accumulator.valid_frame_pairs:
+        state_change_fraction = accumulator.state_change_count / accumulator.valid_frame_pairs
+        trans_gauche_transition_fraction = trans_gauche_transition_count / accumulator.valid_frame_pairs
+    else:
+        state_change_fraction = math.nan
+        trans_gauche_transition_fraction = math.nan
+
+    return {
+        "resname": resname,
+        "tail": tail,
+        "dihedral_index": dihedral_index,
+        "atom1": atom1,
+        "atom2": atom2,
+        "atom3": atom3,
+        "atom4": atom4,
+        "central_bond": f"{atom2}-{atom3}",
+        "n_lipids": n_lipids,
+        "n_frame_pairs": n_frame_pairs,
+        "valid_frame_pairs": accumulator.valid_frame_pairs,
+        "state_change_count": accumulator.state_change_count,
+        "trans_gauche_transition_count": trans_gauche_transition_count,
+        "trans_to_gauche_count": accumulator.trans_to_gauche_count,
+        "gauche_to_trans_count": accumulator.gauche_to_trans_count,
+        "gauche_plus_to_minus_count": accumulator.gauche_plus_to_minus_count,
+        "gauche_minus_to_plus_count": accumulator.gauche_minus_to_plus_count,
+        "to_other_count": accumulator.to_other_count,
+        "from_other_count": accumulator.from_other_count,
+        "state_change_fraction": format_float(state_change_fraction),
+        "trans_gauche_transition_fraction": format_float(trans_gauche_transition_fraction),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CSV Writers
+# ---------------------------------------------------------------------------
+
 def write_summary_csv(
     output_path: Path,
     accumulators: Dict[Key, Accumulator],
     key_to_spec_indices: Dict[Key, List[int]],
     n_frames: int,
 ) -> None:
+    """Write the main trans/gauche ratio summary CSV."""
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "resname",
@@ -571,16 +790,79 @@ def write_summary_csv(
             writer.writerow(accumulator_row(accumulators[key], len(key_to_spec_indices[key]), n_frames))
 
 
+def default_transition_path(output_path: Path) -> Path:
+    """Choose the default transition-count CSV filename."""
+
+    return output_path.with_name(f"{output_path.stem}_transitions_count.csv")
+
+
+def write_transition_csv(
+    output_path: Path,
+    transition_accumulators: Dict[Key, TransitionAccumulator],
+    key_to_spec_indices: Dict[Key, List[int]],
+    n_frames: int,
+) -> None:
+    """Write the separate transition-count CSV."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    n_frame_pairs = max(n_frames - 1, 0)
+    fieldnames = [
+        "resname",
+        "tail",
+        "dihedral_index",
+        "atom1",
+        "atom2",
+        "atom3",
+        "atom4",
+        "central_bond",
+        "n_lipids",
+        "n_frame_pairs",
+        "valid_frame_pairs",
+        "state_change_count",
+        "trans_gauche_transition_count",
+        "trans_to_gauche_count",
+        "gauche_to_trans_count",
+        "gauche_plus_to_minus_count",
+        "gauche_minus_to_plus_count",
+        "to_other_count",
+        "from_other_count",
+        "state_change_fraction",
+        "trans_gauche_transition_fraction",
+    ]
+
+    with output_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for key in sorted(transition_accumulators):
+            writer.writerow(
+                transition_row(
+                    transition_accumulators[key],
+                    len(key_to_spec_indices[key]),
+                    n_frame_pairs,
+                )
+            )
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
 def default_plot_path(output_path: Path, plot_metric: str) -> Path:
+    """Choose the default plot filename from the main CSV filename."""
+
     return output_path.with_name(f"{output_path.stem}_{plot_metric}_per_carbon.png")
 
 
 def safe_filename_part(value: str) -> str:
+    """Sanitize tail labels before inserting them into plot filenames."""
+
     safe_value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return safe_value.strip("._") or "tail"
 
 
 def tail_plot_path(base_path: Path, tail: str, multiple_tails: bool) -> Path:
+    """Append the tail label to the plot filename when more than one tail exists."""
+
     if not multiple_tails:
         return base_path
     return base_path.with_name(f"{base_path.stem}_{safe_filename_part(tail)}{base_path.suffix}")
@@ -595,6 +877,8 @@ def plot_summary_pngs(
     cis_cutoff_deg: float,
     window_deg: float,
 ) -> List[Path]:
+    """Create one scatter plot per tail and return all written PNG paths."""
+
     cache_root = Path(tempfile.gettempdir()) / "tail_dihedral_plot_cache"
     cache_root.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(cache_root / "matplotlib"))
@@ -616,11 +900,14 @@ def plot_summary_pngs(
         "gauche_fraction": "Gauche fraction",
     }
 
+    # Group by tail first so sn1 and sn2 are plotted on separate figures.
     tail_groups: DefaultDict[str, DefaultDict[str, List[Accumulator]]] = defaultdict(lambda: defaultdict(list))
     for accumulator in accumulators.values():
         resname, tail, _dihedral_index, _atom1, _atom2, _atom3, _atom4 = accumulator.key
         tail_groups[tail][resname].append(accumulator)
 
+    # Put the exact rotamer definition on every plot so the figure remains
+    # interpretable even if it is shared without the command used to make it.
     if state_definition == "window":
         cutoff_text = (
             f"State definition: window\n"
@@ -656,6 +943,8 @@ def plot_summary_pngs(
                 if math.isfinite(value):
                     finite_points += 1
 
+            # Use scatter points only: each point is an independent dihedral
+            # position, not a continuous curve.
             ax.scatter(x_values, y_values, s=42, label=resname)
 
         if not finite_points:
@@ -668,6 +957,7 @@ def plot_summary_pngs(
         ax.set_ylabel(metric_labels[plot_metric])
         ax.set_title(f"{tail}: {metric_labels[plot_metric]} per tail carbon position")
         if plot_metric == "trans_gauche_ratio":
+            # Keep sn1 and sn2 ratio plots on the same y-scale for comparison.
             ax.set_ylim(0.0, 4.0)
             ax.set_yticks([0, 1, 2, 3, 4])
         ax.text(
@@ -694,7 +984,13 @@ def plot_summary_pngs(
     return written_paths
 
 
+# ---------------------------------------------------------------------------
+# Main Workflow
+# ---------------------------------------------------------------------------
+
 def validate_args(args: argparse.Namespace) -> None:
+    """Check command-line values before loading potentially large trajectories."""
+
     if args.step <= 0:
         raise SystemExit("--step must be a positive integer.")
     if args.trans_cutoff_deg <= 0.0 or args.trans_cutoff_deg > 180.0:
@@ -706,7 +1002,12 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
+    """Run the full analysis: load trajectory, count states, write CSVs, plot."""
+
     validate_args(args)
+
+    # If the user did not pass --tail, try to infer common lipid tail atom
+    # names. Explicit --tail values remain the safest option for unusual lipids.
     if args.guess_tails is None:
         args.guess_tails = not bool(args.tail)
 
@@ -716,6 +1017,8 @@ def run(args: argparse.Namespace) -> int:
 
     np_module, mda, calc_dihedrals = import_analysis_dependencies()
 
+    # MDAnalysis handles topology plus optional trajectory files. If no
+    # trajectory is supplied, a single-frame structure can still be analyzed.
     if args.trajectory:
         universe = mda.Universe(args.topology, *args.trajectory)
     else:
@@ -730,6 +1033,8 @@ def run(args: argparse.Namespace) -> int:
     if len(residues) == 0:
         raise SystemExit(f"--lipid-select {args.lipid_select!r} selected no residues.")
 
+    # Build the list of concrete atom-index quartets that define all tail
+    # dihedrals. Each lipid contributes the same named dihedral positions.
     if tail_definitions:
         specs, skipped, missing_examples = build_explicit_specs(residues, tail_definitions, args.strict)
         if skipped and not args.quiet:
@@ -751,14 +1056,28 @@ def run(args: argparse.Namespace) -> int:
             '--tail "sn1:C3[1-16]" --tail "sn2:C2[1-18]", and check --lipid-select.'
         )
 
+    # Convert the dihedral atom indices into one array so all torsions can be
+    # calculated vectorially for each frame.
     atom_index_array = np_module.asarray([spec.atom_indices for spec in specs], dtype=np_module.int64)
+
+    # Multiple residues share the same summary key, for example POPC/sn1/
+    # dihedral 5. This mapping tells the script which individual lipid
+    # dihedrals should be pooled into each output row.
     key_to_spec_indices: DefaultDict[Key, List[int]] = defaultdict(list)
     for spec_index, spec in enumerate(specs):
         key_to_spec_indices[spec.key].append(spec_index)
 
     accumulators = {key: Accumulator(key=key) for key in key_to_spec_indices}
+    transition_accumulators = {
+        key: TransitionAccumulator(key=key)
+        for key in key_to_spec_indices
+    }
 
+    # Iterate through the requested frame slice. The first frame initializes
+    # state counts; each later frame is also compared with the previous
+    # analyzed frame to count transitions.
     n_frames = 0
+    previous_states = None
     frame_iterator = universe.trajectory[args.start : args.stop : args.step]
     for timestep in frame_iterator:
         positions = universe.atoms.positions
@@ -771,6 +1090,17 @@ def run(args: argparse.Namespace) -> int:
             box=box,
         )
 
+        # The same state labels are used for both the ratio counts and the
+        # transition counts, so the transition CSV matches the chosen cutoffs.
+        current_states = classify_angle_states(
+            angles,
+            np_module,
+            args.trans_cutoff_deg,
+            args.cis_cutoff_deg,
+            args.state_definition,
+            args.window_deg,
+        )
+
         for key, spec_indices in key_to_spec_indices.items():
             update_accumulator(
                 accumulators[key],
@@ -781,17 +1111,41 @@ def run(args: argparse.Namespace) -> int:
                 args.state_definition,
                 args.window_deg,
             )
+            if previous_states is not None:
+                # Compare each lipid's current dihedral state to its state in
+                # the previous analyzed frame.
+                for spec_index in spec_indices:
+                    update_transition_accumulator(
+                        transition_accumulators[key],
+                        int(previous_states[spec_index]),
+                        int(current_states[spec_index]),
+                    )
 
         n_frames += 1
+        previous_states = current_states.copy()
         if args.progress_every and n_frames % args.progress_every == 0:
             print(f"Analyzed {n_frames} frames...", file=sys.stderr)
 
     if n_frames == 0:
         raise SystemExit("The requested frame slice produced zero frames.")
 
+    # Main output: one row per residue name, tail, and dihedral position.
     output_path = Path(args.output)
     write_summary_csv(output_path, accumulators, dict(key_to_spec_indices), n_frames)
 
+    # Secondary output: one row per residue name, tail, and dihedral position
+    # containing frame-to-frame rotamer transition counts.
+    transition_path = None
+    if not args.no_transition_output:
+        transition_path = Path(args.transition_output) if args.transition_output else default_transition_path(output_path)
+        write_transition_csv(
+            transition_path,
+            transition_accumulators,
+            dict(key_to_spec_indices),
+            n_frames,
+        )
+
+    # Optional plot output: one scatter plot per tail, usually sn1 and sn2.
     plot_path = None
     plot_paths: List[Path] = []
     if not args.no_plot:
@@ -811,6 +1165,8 @@ def run(args: argparse.Namespace) -> int:
             f"Wrote {len(accumulators)} dihedral summaries from {n_frames} frame(s) to {output_path}",
             file=sys.stderr,
         )
+        if transition_path is not None:
+            print(f"Wrote transition counts to {transition_path}", file=sys.stderr)
         if plot_path is not None and plot_paths:
             for written_plot_path in plot_paths:
                 print(f"Wrote per-carbon plot to {written_plot_path}", file=sys.stderr)
@@ -824,6 +1180,8 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Parse CLI arguments and report parser-style errors for bad inputs."""
+
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
