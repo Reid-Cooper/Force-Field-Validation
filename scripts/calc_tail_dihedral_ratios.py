@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+Run Command:
+
+python3 calc_tail_dihedral_ratios.py -s TestFiles/production.tpr -f TestFiles/production_every_100_ps.xtc \
+--lipid-select "resname POPC" --tail 'sn1:C3[1-16]' --tail 'sn2:C2[1-18]' \
+--state-definition window --window-deg 60  # Specifies the window size for trans/gauche classification
+-o popc_tail_ratios.csv
+
+
 Calculate trans/gauche ratios for dihedral angles down lipid tails.
 
 This script uses MDAnalysis to read an MD topology/trajectory, compute every
@@ -22,6 +30,9 @@ named popc_tail_trans_gauche_transitions_count.csv unless --transition-output
 is used. This file reports how often each tail dihedral changes rotamer state
 between consecutive analyzed frames.
 
+The main CSV includes both the trans and gauche probabilities for each
+dihedral, plus trans_gauche_probability_ratio = P(trans) / P(gauche).
+
 Install dependencies:
     python -m pip install MDAnalysis numpy matplotlib
 
@@ -38,7 +49,7 @@ Example with GROMOS-style chain names:
         -s system.gro -f traj.xtc \
         --lipid-select "resname DPPC" \
         --tail "sn1:C[1-16]A" \
-        --tail "sn2:C[1-16]B"
+        --tail "sn2:C[1-18]B"
 
 If --tail is omitted, the script attempts to infer common atom-name patterns.
 For unusual lipid or force-field naming, explicit --tail arguments are safer.
@@ -271,9 +282,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--plot-metric",
-        choices=("trans_gauche_ratio", "trans_fraction", "gauche_fraction"),
-        default="trans_gauche_ratio",
-        help="Metric to graph versus tail dihedral position. Default: trans_gauche_ratio.",
+        choices=("tg_simple_percent", "trans_gauche_ratio", "trans_fraction", "gauche_fraction"),
+        default="tg_simple_percent",
+        help=(
+            "Metric to graph versus tail dihedral position. "
+            "Default: tg_simple_percent, which plots trans_count / "
+            "(trans_count + gauche_count) * 100."
+        ),
     )
     parser.add_argument(
         "--no-plot",
@@ -647,6 +662,26 @@ def trans_gauche_ratio(trans_count: int, gauche_count: int) -> float:
     return math.nan
 
 
+def probability_ratio(numerator_probability: float, denominator_probability: float) -> float:
+    """Compute a probability ratio while preserving nan/inf for zero-probability cases."""
+
+    if denominator_probability > 0.0:
+        return numerator_probability / denominator_probability
+    if numerator_probability > 0.0:
+        return math.inf
+    return math.nan
+
+
+def trans_gauche_simple_percent(accumulator: Accumulator) -> float:
+    """Calculate trans_count / (trans_count + gauche_count) * 100."""
+
+    gauche_count = accumulator.gauche_plus_count + accumulator.gauche_minus_count
+    trans_plus_gauche = accumulator.trans_count + gauche_count
+    if trans_plus_gauche:
+        return (accumulator.trans_count / trans_plus_gauche) * 100.0
+    return math.nan
+
+
 def accumulator_metric(accumulator: Accumulator, metric: str) -> float:
     """Return the requested metric value for plotting."""
 
@@ -655,6 +690,8 @@ def accumulator_metric(accumulator: Accumulator, metric: str) -> float:
 
     if metric == "trans_gauche_ratio":
         return trans_gauche_ratio(accumulator.trans_count, gauche_count)
+    if metric == "tg_simple_percent":
+        return trans_gauche_simple_percent(accumulator)
     if metric == "trans_fraction":
         return accumulator.trans_count / total if total else math.nan
     if metric == "gauche_fraction":
@@ -674,6 +711,7 @@ def accumulator_row(accumulator: Accumulator, n_lipids: int, n_frames: int) -> D
     gauche_plus_fraction = accumulator.gauche_plus_count / total if total else math.nan
     gauche_minus_fraction = accumulator.gauche_minus_count / total if total else math.nan
     ratio = trans_gauche_ratio(accumulator.trans_count, gauche_count)
+    probability_ratio_value = probability_ratio(trans_fraction, gauche_fraction)
 
     mean_angle = math.degrees(math.atan2(accumulator.sin_sum, accumulator.cos_sum)) if total else math.nan
 
@@ -699,12 +737,14 @@ def accumulator_row(accumulator: Accumulator, n_lipids: int, n_frames: int) -> D
         "gauche_plus_fraction": format_float(gauche_plus_fraction),
         "gauche_minus_fraction": format_float(gauche_minus_fraction),
         "trans_gauche_ratio": format_float(ratio),
+        "trans_gauche_probability_ratio": format_float(probability_ratio_value),
         "mean_angle_deg": format_float(mean_angle),
     }
 
 
 def transition_row(
     accumulator: TransitionAccumulator,
+    state_accumulator: Accumulator,
     n_lipids: int,
     n_frame_pairs: int,
 ) -> Dict[str, object]:
@@ -732,6 +772,7 @@ def transition_row(
         "n_lipids": n_lipids,
         "n_frame_pairs": n_frame_pairs,
         "valid_frame_pairs": accumulator.valid_frame_pairs,
+        "t/g_simple_percent": format_float(trans_gauche_simple_percent(state_accumulator)),
         "state_change_count": accumulator.state_change_count,
         "trans_gauche_transition_count": trans_gauche_transition_count,
         "trans_to_gauche_count": accumulator.trans_to_gauche_count,
@@ -780,6 +821,7 @@ def write_summary_csv(
         "gauche_plus_fraction",
         "gauche_minus_fraction",
         "trans_gauche_ratio",
+        "trans_gauche_probability_ratio",
         "mean_angle_deg",
     ]
 
@@ -799,6 +841,7 @@ def default_transition_path(output_path: Path) -> Path:
 def write_transition_csv(
     output_path: Path,
     transition_accumulators: Dict[Key, TransitionAccumulator],
+    state_accumulators: Dict[Key, Accumulator],
     key_to_spec_indices: Dict[Key, List[int]],
     n_frames: int,
 ) -> None:
@@ -818,6 +861,7 @@ def write_transition_csv(
         "n_lipids",
         "n_frame_pairs",
         "valid_frame_pairs",
+        "t/g_simple_percent",
         "state_change_count",
         "trans_gauche_transition_count",
         "trans_to_gauche_count",
@@ -837,6 +881,7 @@ def write_transition_csv(
             writer.writerow(
                 transition_row(
                     transition_accumulators[key],
+                    state_accumulators[key],
                     len(key_to_spec_indices[key]),
                     n_frame_pairs,
                 )
@@ -894,7 +939,21 @@ def plot_summary_pngs(
             "Missing dependency: matplotlib. Install with: python -m pip install matplotlib"
         ) from exc
 
+    plt.rcParams.update(
+        {
+            "font.size": 13,
+            "axes.labelsize": 15,
+            "axes.titlesize": 16,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "legend.fontsize": 12,
+            "figure.dpi": 150,
+            "savefig.dpi": 400,
+        }
+    )
+
     metric_labels = {
+        "tg_simple_percent": "Trans Configuration Percent (%)",
         "trans_gauche_ratio": "Trans/Gauche ratio",
         "trans_fraction": "Trans fraction",
         "gauche_fraction": "Gauche fraction",
@@ -926,7 +985,7 @@ def plot_summary_pngs(
     written_paths: List[Path] = []
     multiple_tails = len(tail_groups) > 1
     for tail, resname_groups in sorted(tail_groups.items()):
-        fig, ax = plt.subplots(figsize=(8.0, 5.0))
+        fig, ax = plt.subplots(figsize=(9.0, 5.8))
         finite_points = 0
         all_positions = set()
 
@@ -945,7 +1004,16 @@ def plot_summary_pngs(
 
             # Use scatter points only: each point is an independent dihedral
             # position, not a continuous curve.
-            ax.scatter(x_values, y_values, s=42, label=resname)
+            ax.scatter(
+                x_values,
+                y_values,
+                s=85,
+                alpha=0.92,
+                edgecolors="black",
+                linewidths=0.8,
+                label=resname,
+                zorder=3,
+            )
 
         if not finite_points:
             plt.close(fig)
@@ -953,13 +1021,19 @@ def plot_summary_pngs(
 
         if all_positions:
             ax.set_xticks(sorted(all_positions))
-        ax.set_xlabel("Dihedral position along tail (central C-C bond)")
+        ax.set_xlabel("Dihedral (central C-C bond)")
         ax.set_ylabel(metric_labels[plot_metric])
-        ax.set_title(f"{tail}: {metric_labels[plot_metric]} per tail carbon position")
-        if plot_metric == "trans_gauche_ratio":
+        ax.set_title(f"{tail}: {metric_labels[plot_metric]}")
+        if plot_metric == "tg_simple_percent":
+            ax.set_ylim(0.0, 100.0)
+            ax.set_yticks([0, 25, 50, 75, 100])
+        elif plot_metric == "trans_gauche_ratio":
             # Keep sn1 and sn2 ratio plots on the same y-scale for comparison.
             ax.set_ylim(0.0, 4.0)
             ax.set_yticks([0, 1, 2, 3, 4])
+        elif plot_metric in ("trans_fraction", "gauche_fraction"):
+            ax.set_ylim(0.0, 1.0)
+            ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
         ax.text(
             0.02,
             0.98,
@@ -967,17 +1041,23 @@ def plot_summary_pngs(
             transform=ax.transAxes,
             va="top",
             ha="left",
-            fontsize=8.5,
-            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.7", "alpha": 0.9},
+            fontsize=10,
+            bbox={"boxstyle": "round,pad=0.4", "facecolor": "white", "edgecolor": "0.7", "alpha": 0.92},
         )
-        ax.grid(True, alpha=0.3)
+        ax.set_axisbelow(True)
+        ax.grid(True, axis="y", color="0.84", linewidth=0.9)
+        ax.grid(True, axis="x", color="0.92", linewidth=0.6)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_linewidth(1.1)
+        ax.spines["bottom"].set_linewidth(1.1)
         if len(resname_groups) > 1:
             ax.legend(frameon=False)
 
-        fig.tight_layout()
+        fig.tight_layout(pad=1.4)
         plot_path = tail_plot_path(output_path, tail, multiple_tails)
         plot_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(plot_path, dpi=300)
+        fig.savefig(plot_path, dpi=400, bbox_inches="tight")
         plt.close(fig)
         written_paths.append(plot_path)
 
@@ -1141,6 +1221,7 @@ def run(args: argparse.Namespace) -> int:
         write_transition_csv(
             transition_path,
             transition_accumulators,
+            accumulators,
             dict(key_to_spec_indices),
             n_frames,
         )
