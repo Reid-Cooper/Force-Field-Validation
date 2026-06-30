@@ -1,6 +1,6 @@
-- This package of python scripts is meant to be used together with the primary file, getMetrics.py 
+- This package of python scripts is meant to be used together with the primary file, getMetrics.py
 - This utilizes flags to "one shot" most of the metric gathering process for lipid bilayers
 - Results include surface tension, the bending modulus, APL, bilayer thickness, dihedral ratios and more
 - A FAIRMD system directory is needed for this package to work
 - For information regarding uploading a simulation and making a FAIRMD system please reference their toturials: 
-- https://databank.readthedocs.io/stable/contrib/addingSimulation.html 
+- https://databank.readthedocs.io/stable/contrib/addingSimulation.html
